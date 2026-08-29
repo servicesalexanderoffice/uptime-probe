@@ -75,6 +75,10 @@ jobs:
           if [ "$new_state" != "$state" ]; then
             sha=$(gh api "repos/$REPO/contents/state.json?ref=state" -q .sha 2>/dev/null || echo "")
             b64=$(printf '%s' "$new_state" | base64 -w0)
-            gh api -X PUT "repos/$REPO/contents/state.json" -f message="state" -f content="$b64" -f branch=state ${sha:+-f sha=$sha} >/dev/null
+            if [ -n "$sha" ]; then
+              gh api -X PUT "repos/$REPO/contents/state.json" -f message=state -f content="$b64" -f branch=state -f sha="$sha" >/dev/null
+            else
+              gh api -X PUT "repos/$REPO/contents/state.json" -f message=state -f content="$b64" -f branch=state >/dev/null
+            fi
             echo "state saved: $new_state"
           fi
