@@ -1,0 +1,75 @@
+name: probe
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+permissions:
+  actions: write
+concurrency:
+  group: probe
+  cancel-in-progress: false
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: check and alert
+        env:
+          HEALTH_URL: ${{ secrets.HEALTH_URL }}
+          GHL_TOKEN: ${{ secrets.GHL_TOKEN }}
+          CONTACT_ID: ${{ secrets.CONTACT_ID }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -u
+          ok=0
+          for i in 1 2 3; do
+            body=$(curl -s --max-time 15 "$HEALTH_URL" || true)
+            if echo "$body" | grep -q '"ok":true'; then ok=1; break; fi
+            sleep 20
+          done
+          pending=$(echo "${body:-}" | grep -o '"pendingScheduled":[0-9]*' | grep -o '[0-9]*' || echo "")
+
+          state=$(gh api "repos/$REPO/actions/variables/WATCHDOG_STATE" -q .value 2>/dev/null || echo '{}')
+          fails=$(echo "$state" | grep -o '"fails":[0-9]*' | grep -o '[0-9]*' || echo 0); fails=${fails:-0}
+          alerted=$(echo "$state" | grep -o '"alerted":true' || true)
+          last_pending=$(echo "$state" | grep -o '"pending":[0-9]*' | grep -o '[0-9]*' || echo 0); last_pending=${last_pending:-0}
+          down_since=$(echo "$state" | grep -o '"downSince":[0-9]*' | grep -o '[0-9]*' || echo 0); down_since=${down_since:-0}
+          last_alert=$(echo "$state" | grep -o '"lastAlert":[0-9]*' | grep -o '[0-9]*' || echo 0); last_alert=${last_alert:-0}
+          now=$(date +%s)
+
+          send_sms() {
+            curl -s -X POST https://services.leadconnectorhq.com/conversations/messages \
+              -H "Authorization: Bearer $GHL_TOKEN" -H "Version: 2021-04-15" \
+              -H "Content-Type: application/json" \
+              -d "{\"type\":\"SMS\",\"contactId\":\"$CONTACT_ID\",\"message\":$(printf '%s' "$1" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))')}" >/dev/null
+          }
+
+          if [ "$ok" = "1" ]; then
+            if [ -n "$alerted" ]; then
+              mins=$(( (now - down_since) / 60 ))
+              send_sms "✅ Mac mini is back online (down ~${mins} min). Sibo HQ is up; any overdue scheduled replies are sending now."
+            fi
+            new_state="{\"fails\":0,\"alerted\":false,\"downSince\":0,\"lastAlert\":0,\"pending\":${pending:-0}}"
+            echo "healthy (pending=${pending:-0})"
+          else
+            fails=$((fails + 1))
+            [ "$down_since" = "0" ] && down_since=$now
+            do_alert=""
+            if [ -z "$alerted" ] && [ "$fails" -ge 2 ]; then do_alert=1; fi
+            if [ -n "$alerted" ] && [ $((now - last_alert)) -gt 21600 ]; then do_alert=1; fi
+            if [ -n "$do_alert" ]; then
+              mins=$(( (now - down_since) / 60 ))
+              extra=""
+              if [ "$last_pending" -gt 0 ]; then extra=" ${last_pending} scheduled reply(ies) are waiting and will send late."; fi
+              send_sms "🐕⚠️ Mac mini has been unreachable for ~${mins} min. Sibo HQ, message sync, and schedules are paused.${extra} (Check power/internet at the house.)"
+              new_state="{\"fails\":$fails,\"alerted\":true,\"downSince\":$down_since,\"lastAlert\":$now,\"pending\":$last_pending}"
+            else
+              a=false; [ -n "$alerted" ] && a=true
+              new_state="{\"fails\":$fails,\"alerted\":$a,\"downSince\":$down_since,\"lastAlert\":$last_alert,\"pending\":$last_pending}"
+            fi
+            echo "unreachable (fails=$fails)"
+          fi
+
+          gh api -X PATCH "repos/$REPO/actions/variables/WATCHDOG_STATE" -f name=WATCHDOG_STATE -f value="$new_state" 2>/dev/null \
+            || gh api -X POST "repos/$REPO/actions/variables" -f name=WATCHDOG_STATE -f value="$new_state"
