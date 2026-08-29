@@ -71,8 +71,12 @@ jobs:
             echo "unreachable (fails=$fails)"
           fi
 
-          # Persist only when the state actually changed (steady healthy = no writes).
-          if [ "$new_state" != "$state" ]; then
+          # Persist when changed — plus a monthly keep-alive commit, because
+          # GitHub disables cron workflows after 60 days without repo activity.
+          w=$(echo "$state" | grep -o '"w":[0-9]*' | grep -o '[0-9]*' || echo 0); w=${w:-0}
+          prev_no_w=$(echo "$state" | sed 's/,"w":[0-9]*//')
+          if [ "$new_state" != "$prev_no_w" ] || [ $((now - w)) -gt 2592000 ]; then
+            new_state="${new_state%\}},\"w\":$now}"
             sha=$(gh api "repos/$REPO/contents/state.json?ref=state" -q .sha 2>/dev/null || echo "")
             b64=$(printf '%s' "$new_state" | base64 -w0)
             if [ -n "$sha" ]; then
