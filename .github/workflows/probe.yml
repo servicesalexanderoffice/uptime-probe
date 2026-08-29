@@ -4,7 +4,7 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 permissions:
-  actions: write
+  contents: write
 concurrency:
   group: probe
   cancel-in-progress: false
@@ -30,7 +30,7 @@ jobs:
           done
           pending=$(echo "${body:-}" | grep -o '"pendingScheduled":[0-9]*' | grep -o '[0-9]*' || echo "")
 
-          state=$(gh api "repos/$REPO/actions/variables/WATCHDOG_STATE" -q .value 2>/dev/null || echo '{}')
+          state=$(gh api "repos/$REPO/contents/state.json?ref=state" -q .content 2>/dev/null | base64 -d 2>/dev/null || echo '{}')
           fails=$(echo "$state" | grep -o '"fails":[0-9]*' | grep -o '[0-9]*' || echo 0); fails=${fails:-0}
           alerted=$(echo "$state" | grep -o '"alerted":true' || true)
           last_pending=$(echo "$state" | grep -o '"pending":[0-9]*' | grep -o '[0-9]*' || echo 0); last_pending=${last_pending:-0}
@@ -71,5 +71,10 @@ jobs:
             echo "unreachable (fails=$fails)"
           fi
 
-          gh api -X PATCH "repos/$REPO/actions/variables/WATCHDOG_STATE" -f name=WATCHDOG_STATE -f value="$new_state" 2>/dev/null \
-            || gh api -X POST "repos/$REPO/actions/variables" -f name=WATCHDOG_STATE -f value="$new_state"
+          # Persist only when the state actually changed (steady healthy = no writes).
+          if [ "$new_state" != "$state" ]; then
+            sha=$(gh api "repos/$REPO/contents/state.json?ref=state" -q .sha 2>/dev/null || echo "")
+            b64=$(printf '%s' "$new_state" | base64 -w0)
+            gh api -X PUT "repos/$REPO/contents/state.json" -f message="state" -f content="$b64" -f branch=state ${sha:+-f sha=$sha} >/dev/null
+            echo "state saved: $new_state"
+          fi
