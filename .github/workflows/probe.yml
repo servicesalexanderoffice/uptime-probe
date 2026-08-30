@@ -62,7 +62,7 @@ jobs:
               mins=$(( (now - down_since) / 60 ))
               extra=""
               if [ "$last_pending" -gt 0 ]; then extra=" ${last_pending} scheduled reply(ies) are waiting and will send late."; fi
-              send_sms "🐕⚠️ Mac mini has been unreachable for ~${mins} min. Sibo HQ, message sync, and schedules are paused.${extra} (Check power/internet at the house.)"
+              send_sms "🐕⚠️ Sibo HQ health check failing for ~${mins} min. Mac may be down, or just the sibo-hq app/funnel. Message sync and schedules are paused.${extra} (If other apps still load, dispatch a fix; else check power/internet.)"
               new_state="{\"fails\":$fails,\"alerted\":true,\"downSince\":$down_since,\"lastAlert\":$now,\"pending\":$last_pending}"
             else
               a=false; [ -n "$alerted" ] && a=true
