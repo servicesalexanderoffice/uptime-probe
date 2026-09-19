@@ -16,19 +16,39 @@ jobs:
       - name: check and alert
         env:
           HEALTH_URL: ${{ secrets.HEALTH_URL }}
+          FLEET_URL: ${{ secrets.FLEET_URL }}
+          FIX_URL: ${{ secrets.FIX_URL }}
           GHL_TOKEN: ${{ secrets.GHL_TOKEN }}
           CONTACT_ID: ${{ secrets.CONTACT_ID }}
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
           set -u
-          ok=0
+          # --- probe Sibo HQ health (3 tries, as v1) ---
+          hq_ok=0; body=""
           for i in 1 2 3; do
             body=$(curl -s --max-time 15 "$HEALTH_URL" || true)
-            if echo "$body" | grep -q '"ok":true'; then ok=1; break; fi
+            if echo "$body" | grep -q '"ok":true'; then hq_ok=1; break; fi
             sleep 20
           done
           pending=$(echo "${body:-}" | grep -o '"pendingScheduled":[0-9]*' | grep -o '[0-9]*' || echo "")
+
+          # --- probe fleet health (v2): counts-only public endpoint ---
+          fleet_ok=0; fleet_body=""
+          if [ -n "${FLEET_URL:-}" ]; then
+            for i in 1 2; do
+              fleet_body=$(curl -s --max-time 15 "$FLEET_URL" || true)
+              if echo "$fleet_body" | grep -q '"ok":true'; then fleet_ok=1; break; fi
+              sleep 10
+            done
+          else
+            fleet_ok=1  # secret not set yet -> don't fail on the new check
+          fi
+
+          ok=0; [ "$hq_ok" = "1" ] && [ "$fleet_ok" = "1" ] && ok=1
+          # dark = neither endpoint returned ANY body -> Mac/funnel/internet down,
+          # not a single-app failure. Both empty bodies is the tell.
+          dark=0; [ -z "${body:-}" ] && [ -z "${fleet_body:-}" ] && dark=1
 
           state=$(gh api "repos/$REPO/contents/state.json?ref=state" -q .content 2>/dev/null | base64 -d 2>/dev/null || echo '{}')
           fails=$(echo "$state" | grep -o '"fails":[0-9]*' | grep -o '[0-9]*' || echo 0); fails=${fails:-0}
@@ -48,10 +68,10 @@ jobs:
           if [ "$ok" = "1" ]; then
             if [ -n "$alerted" ]; then
               mins=$(( (now - down_since) / 60 ))
-              send_sms "✅ Mac mini is back online (down ~${mins} min). Sibo HQ is up; any overdue scheduled replies are sending now."
+              send_sms "✅ Mac mini is back online (down ~${mins} min). Sibo HQ and fleet are healthy; any overdue scheduled replies are sending now."
             fi
             new_state="{\"fails\":0,\"alerted\":false,\"downSince\":0,\"lastAlert\":0,\"pending\":${pending:-0}}"
-            echo "healthy (pending=${pending:-0})"
+            echo "healthy (pending=${pending:-0}, fleet ok)"
           else
             fails=$((fails + 1))
             [ "$down_since" = "0" ] && down_since=$now
@@ -60,15 +80,30 @@ jobs:
             if [ -n "$alerted" ] && [ $((now - last_alert)) -gt 21600 ]; then do_alert=1; fi
             if [ -n "$do_alert" ]; then
               mins=$(( (now - down_since) / 60 ))
-              extra=""
-              if [ "$last_pending" -gt 0 ]; then extra=" ${last_pending} scheduled reply(ies) are waiting and will send late."; fi
-              send_sms "🐕⚠️ Sibo HQ health check failing for ~${mins} min. Mac may be down, or just the sibo-hq app/funnel. Message sync and schedules are paused.${extra} (If other apps still load, dispatch a fix; else check power/internet.)"
+              if [ "$dark" = "1" ]; then
+                # Nothing on the Mac is reachable from the internet -> no auto-fix
+                # path exists. This SMS comes from GitHub+GHL cloud, Mac-independent.
+                send_sms "🖤 MAC DARK — Sibo HQ and fleet-health are both unreachable from the internet (~${mins} min). Likely power, internet, or tailscale down. No auto-fix possible from outside; check the Mac (power light, router). Message sync, schedules and lead apps are all paused."
+              else
+                job="sibohq"; what="Sibo HQ health check"
+                if [ "$hq_ok" = "1" ]; then job="fleet"; what="fleet health (an always-on app is down/sick)"; fi
+                fix_note="auto-fix trigger not configured"
+                if [ -n "${FIX_URL:-}" ]; then
+                  fix_resp=$(curl -s --max-time 20 -X POST "${FIX_URL}&job=${job}" || true)
+                  if echo "$fix_resp" | grep -q '"dispatched":true'; then fix_note="🔧 auto-fix Claude session dispatched on the Mac"
+                  elif echo "$fix_resp" | grep -q 'rate-limited'; then fix_note="🔧 auto-fix already dispatched recently (rate-limited)"
+                  else fix_note="⚠️ auto-fix trigger failed (${fix_resp:-no response})"; fi
+                fi
+                extra=""
+                if [ "$last_pending" -gt 0 ]; then extra=" ${last_pending} scheduled reply(ies) are waiting and will send late."; fi
+                send_sms "🐕⚠️ ${what} failing for ~${mins} min (Mac partially up — other endpoints answer). ${fix_note}.${extra}"
+              fi
               new_state="{\"fails\":$fails,\"alerted\":true,\"downSince\":$down_since,\"lastAlert\":$now,\"pending\":$last_pending}"
             else
               a=false; [ -n "$alerted" ] && a=true
               new_state="{\"fails\":$fails,\"alerted\":$a,\"downSince\":$down_since,\"lastAlert\":$last_alert,\"pending\":$last_pending}"
             fi
-            echo "unreachable (fails=$fails)"
+            echo "unreachable (fails=$fails, hq_ok=$hq_ok fleet_ok=$fleet_ok dark=$dark)"
           fi
 
           # Persist when changed — plus a monthly keep-alive commit, because
